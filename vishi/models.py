@@ -1,7 +1,12 @@
-# vishi/models.py
-
 from django.db import models
+from django.utils import timezone
 from accounts.models import User
+
+
+class VishiManager(models.Manager):
+    """Default manager excludes soft-deleted vishis."""
+    def get_queryset(self):
+        return super().get_queryset().filter(is_deleted=False)
 
 
 class Vishi(models.Model):
@@ -29,7 +34,7 @@ class Vishi(models.Model):
     current_release_date    = models.DateField()
     start_date              = models.DateField()
     finish_date             = models.DateField()
-    status                  = models.CharField(max_length=20, choices=STATUS_CHOICES, default='upcoming')  # FIXED: was 'active'
+    status                  = models.CharField(max_length=20, choices=STATUS_CHOICES, default='upcoming')
     current_cycle           = models.PositiveIntegerField(default=0)
     total_cycles            = models.PositiveIntegerField(default=0)
     missed_cycles           = models.PositiveIntegerField(default=0)
@@ -37,9 +42,23 @@ class Vishi(models.Model):
         'VishiParticipant', null=True, blank=True,
         on_delete=models.SET_NULL, related_name='fixed_draw_vishi'
     )
+    # ← ADDED: soft delete fields
+    is_deleted              = models.BooleanField(default=False)
+    deleted_at              = models.DateTimeField(null=True, blank=True)
     created_by              = models.ForeignKey(User, on_delete=models.PROTECT, related_name='created_vishis')
     created_at              = models.DateTimeField(auto_now_add=True)
     updated_at              = models.DateTimeField(auto_now=True)
+
+    objects     = VishiManager()           # default: excludes deleted
+    all_objects = models.Manager()         # ← ADDED: use for admin/superuser full access
+
+    def soft_delete(self):
+        """Soft-delete the vishi and deactivate all associated ledgers."""
+        self.is_deleted = True
+        self.deleted_at = timezone.now()
+        self.save(update_fields=['is_deleted', 'deleted_at'])
+        # Deactivate all ledgers so cron skips future charges
+        self.ledgers.filter(is_active=True).update(is_active=False)
 
     def __str__(self):
         return self.name
@@ -50,7 +69,7 @@ class Vishi(models.Model):
 
 
 class VishiParticipant(models.Model):
-    vishi      = models.ForeignKey(Vishi, on_delete=models.CASCADE, related_name='participants')
+    vishi      = models.ForeignKey(Vishi.all_objects.model, on_delete=models.CASCADE, related_name='participants')
     user       = models.ForeignKey(User, on_delete=models.PROTECT, related_name='participations')
     vishi_name = models.CharField(max_length=150, blank=True)
     is_active  = models.BooleanField(default=True)
@@ -65,7 +84,7 @@ class VishiParticipant(models.Model):
 
 
 class VishiDrawRecord(models.Model):
-    vishi           = models.ForeignKey(Vishi, on_delete=models.CASCADE, related_name='draw_records')
+    vishi           = models.ForeignKey(Vishi.all_objects.model, on_delete=models.CASCADE, related_name='draw_records')
     participant     = models.ForeignKey(VishiParticipant, on_delete=models.PROTECT, related_name='draw_records')
     cycle_number    = models.PositiveIntegerField()
     was_fixed       = models.BooleanField(default=False)
@@ -89,7 +108,7 @@ class CollectionLedger(models.Model):
         ('overpaid', 'Overpaid'),
     ]
 
-    vishi           = models.ForeignKey(Vishi, on_delete=models.CASCADE, related_name='ledgers')
+    vishi           = models.ForeignKey(Vishi.all_objects.model, on_delete=models.CASCADE, related_name='ledgers')
     participant     = models.ForeignKey(VishiParticipant, on_delete=models.CASCADE, related_name='ledger')
     balance         = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status          = models.CharField(max_length=20, choices=STATUS_CHOICES, default='paid')
@@ -137,12 +156,11 @@ class PaymentEntry(models.Model):
         ordering = ['created_at']
 
 
-# NEW: Audit trail for every skipped cycle
 class SkipRecord(models.Model):
-    vishi      = models.ForeignKey(Vishi, on_delete=models.CASCADE, related_name='skip_records')
+    vishi      = models.ForeignKey(Vishi.all_objects.model, on_delete=models.CASCADE, related_name='skip_records')
     skipped_at = models.DateTimeField(auto_now_add=True)
     reason     = models.TextField(blank=True)
-    is_auto    = models.BooleanField(default=False)  # True = cron auto-skip | False = admin manual
+    is_auto    = models.BooleanField(default=False)
 
     def __str__(self):
         kind = 'Auto' if self.is_auto else 'Manual'
