@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import IsAuthenticated
 
 from .models import User
 from .serializers import UserSerializer
@@ -165,6 +166,7 @@ class AuthViewSet(viewsets.ViewSet):
 
 
 class ProfileViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
 
     @action(detail=False, methods=['get'], url_path='me')
     def me(self, request):
@@ -185,3 +187,99 @@ class ProfileViewSet(viewsets.ViewSet):
         request.user.password = None
         request.user.save(update_fields=['password'])
         return Response({'detail': 'Password cleared. Please set a new one on next login.'})
+
+        # ─── ADDED: M5 — GET /api/profile/me/vishis/ ─────────────────────────────
+    @action(detail=False, methods=['get'], url_path='me/vishis')
+    def my_vishis(self, request):
+        from vishi.models import Vishi, VishiParticipant
+        from vishi.serializers import MyVishiSlotSerializer
+        from decimal import Decimal
+
+        user   = request.user
+        vishis = Vishi.objects.filter(
+            participants__user=user,
+            participants__is_active=True,
+        ).distinct().order_by('-created_at')
+
+        result = []
+        for vishi in vishis:
+            my_slots = VishiParticipant.objects.filter(
+                vishi=vishi, user=user, is_active=True
+            )
+
+            total_balance = Decimal('0')
+            has_due       = False
+            for slot in my_slots:
+                ledger = slot.ledger.filter(is_active=True).first()
+                if ledger:
+                    total_balance += ledger.balance
+                    if ledger.status == 'due':
+                        has_due = True
+
+            result.append({
+                'vishi_id':                vishi.id,
+                'vishi_name':              vishi.name,
+                'amount':                  str(vishi.amount),
+                'frequency':               vishi.frequency,
+                'status':                  vishi.status,
+                'current_cycle':           vishi.current_cycle,
+                'total_cycles':            vishi.total_cycles,
+                'current_draw_date':       str(vishi.current_draw_date),
+                'current_collection_date': str(vishi.current_collection_date),
+                'current_release_date':    str(vishi.current_release_date),
+                # FIXED: serialize slots HERE on the queryset (model instances), not inside MyVishiGroupedSerializer
+                'my_slots':                MyVishiSlotSerializer(my_slots, many=True).data,
+                'total_balance':           str(total_balance),
+                'has_due':                 has_due,
+            })
+
+        # FIXED: return result directly — it's already fully serialized
+        # MyVishiGroupedSerializer(result, many=True) would try to re-serialize
+        # my_slots dicts through MyVishiSlotSerializer → crash on obj.ledger
+        return Response(result)
+
+
+    # ─── ADDED: M6 — GET /api/profile/me/payments/ ───────────────────────────
+    @action(detail=False, methods=['get'], url_path='me/payments')
+    def my_payments(self, request):
+        from vishi.models import Vishi, CollectionLedger
+        from vishi.serializers import PaymentEntrySerializer
+        from decimal import Decimal
+
+        user   = request.user
+        vishis = Vishi.objects.filter(
+            participants__user=user,
+            participants__is_active=True,
+        ).distinct()
+
+        result = []
+        for vishi in vishis:
+            ledgers = CollectionLedger.objects.filter(
+                vishi=vishi, participant__user=user
+            ).prefetch_related('entries', 'participant')
+
+            slots         = []
+            total_balance = Decimal('0')
+            for ledger in ledgers:
+                total_balance += ledger.balance
+                slots.append({
+                    'slot_name': ledger.participant.vishi_name,
+                    'balance':   str(ledger.balance),
+                    'status':    ledger.status,
+                    'entries':   PaymentEntrySerializer(
+                        ledger.entries.all(), many=True
+                    ).data,
+                })
+
+            result.append({
+                'vishi_id':      vishi.id,
+                'vishi_name':    vishi.name,
+                'vishi_status':  vishi.status,
+                'slots':         slots,
+                'total_balance': str(total_balance),
+            })
+
+        # FIXED: return directly — already fully built, no need for MyPaymentVishiSerializer
+        return Response(result)
+
+
