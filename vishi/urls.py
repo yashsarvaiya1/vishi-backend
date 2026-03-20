@@ -8,6 +8,7 @@ from .views import (
     CollectionLedgerViewSet, PaymentEntryViewSet,
     SkipRecordViewSet,
     DashboardView, PaymentsSummaryView,
+    MyVishisView, MyPaymentsView,              # ← add
 )
 
 
@@ -27,8 +28,9 @@ urlpatterns = (
     + vishi_router.urls
     + ledger_router.urls
     + [
-        path('dashboard/',        DashboardView.as_view(),       name='dashboard'),
-        # FIXED: was 'payments/summary/' — endpoint doc specifies /api/payments-summary/
-        path('payments-summary/', PaymentsSummaryView.as_view(), name='payments-summary'),
+        path('dashboard/',           DashboardView.as_view(),    name='dashboard'),
+        path('payments-summary/',    PaymentsSummaryView.as_view(), name='payments-summary'),
+        path('profile/me/vishis/',   MyVishisView.as_view(),     name='my-vishis'),   # ← add
+        path('profile/me/payments/', MyPaymentsView.as_view(),   name='my-payments'), # ← add
     ]
 )

@@ -1,35 +1,36 @@
+# vishi/cron.py
+
 from datetime import date
-from django.utils import timezone
-from .models import Vishi, CollectionLedger, PaymentEntry
-from .services import advance_date, perform_skip
+from .models import Vishi, CollectionLedger
+from .services import advance_date, perform_skip, charge_vishi  # ← charge_vishi replaces inline logic
 
 
 def charge_collection():
+    """
+    Safety-net cron: charges vishis where collection_date == today AND
+    the draw has already happened this cycle (current_cycle > 0) but
+    the ledgers haven't been charged yet for this cycle.
+
+    In normal flow perform_draw() calls charge_vishi() immediately,
+    so this cron is a no-op most of the time. It only fires if the draw
+    happened late or the server was down on draw day.
+    """
     today = date.today()
-    # ← FIXED: use all_objects to be explicit, filter is_deleted=False
     for vishi in Vishi.all_objects.filter(status='active', is_deleted=False, current_collection_date=today):
-        for ledger in CollectionLedger.objects.filter(vishi=vishi, is_active=True):
-            ledger.balance        -= vishi.amount
-            ledger.last_charged_at = timezone.now()
-            ledger.update_status()
-            ledger.save()
-            PaymentEntry.objects.create(
-                ledger       = ledger,
-                amount       = -vishi.amount,
-                entry_type   = 'charge',
-                cycle_number = vishi.current_cycle,
-                recorded_by  = None,
-            )
-        vishi.current_collection_date = advance_date(vishi.current_collection_date, vishi.frequency)
-        vishi.save(update_fields=['current_collection_date'])
+        # ← ADDED guard: skip if ledgers were already charged this cycle
+        already_charged = vishi.ledgers.filter(
+            is_active=True,
+            entries__entry_type='charge',
+            entries__cycle_number=vishi.current_cycle,
+        ).exists()
+        if already_charged:
+            continue
+        charge_vishi(vishi)
 
 
 def auto_skip_missed_draws():
     today = date.today()
-    # ← FIXED: use all_objects with is_deleted=False
     for vishi in Vishi.all_objects.filter(status='active', is_deleted=False):
-        # ← FIXED: check if release_date has passed AND no draw record for the NEXT cycle
-        # current_cycle is the last completed draw count, so next expected = current_cycle + 1
         if today > vishi.current_release_date:
             has_draw = vishi.draw_records.filter(cycle_number=vishi.current_cycle + 1).exists()
             if not has_draw:
@@ -41,7 +42,6 @@ def auto_skip_missed_draws():
 
 
 def update_vishi_status():
-    # ← FIXED: use all_objects with is_deleted=False
     for vishi in Vishi.all_objects.filter(status='active', is_deleted=False):
         all_drawn    = not vishi.participants.filter(is_active=True, is_drawn=False).exists()
         all_released = not vishi.draw_records.filter(is_released=False).exists()

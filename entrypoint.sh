@@ -10,21 +10,28 @@ python manage.py migrate --noinput
 echo "📦 Collecting static files..."
 python manage.py collectstatic --noinput
 
-echo "👤 Creating superuser..."
+echo "👤 Syncing superuser..."
 python manage.py shell -c "
 from accounts.models import User
 import os
 mobile   = os.environ.get('SUPERUSER_MOBILE')
 password = os.environ.get('SUPERUSER_PASSWORD')
-if mobile and not User.objects.filter(mobile_number=mobile).exists():
-    User.objects.create_superuser(mobile_number=mobile, password=password)
-    print(f'Superuser created: {mobile}')
+if not mobile or not password:
+    print('SUPERUSER_MOBILE or SUPERUSER_PASSWORD not set — skipping.')
 else:
-    print('Superuser already exists.')
+    user, created = User.objects.get_or_create(mobile_number=mobile)
+    user.set_password(password)
+    user.is_staff = True
+    user.is_superuser = True
+    user.save()
+    print(f'Superuser {\"created\" if created else \"updated\"}: {mobile}')
 "
 
 echo "⏰ Adding cron jobs..."
 python manage.py crontab add
 
+echo "🕐 Starting cron daemon..."
+cron
+
 echo "🚀 Starting Gunicorn..."
-exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120
+exec gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120
