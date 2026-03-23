@@ -40,6 +40,11 @@ class VishiViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_superuser:
+            # Check if caller explicitly wants deleted vishis
+            show_deleted = self.request.query_params.get('is_deleted', 'false').lower()
+            if show_deleted == 'true':
+                return Vishi.all_objects.filter(is_deleted=True)
+            # Default: non-deleted only (fast — same as before)
             return Vishi.all_objects.filter(is_deleted=False)
         return Vishi.objects.filter(
             participants__user=user, participants__is_active=True
@@ -52,7 +57,7 @@ class VishiViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy',
-                        'activate', 'draw', 'release', 'skip_cycle', 'set_fix_draw']:
+                        'activate', 'draw', 'release', 'skip_cycle', 'set_fix_draw','restore']:
             return [IsSuperUser()]
         return [IsAuthenticated()]
 
@@ -171,6 +176,27 @@ class VishiViewSet(viewsets.ModelViewSet):
         vishi.fix_draw_participant = participant
         vishi.save(update_fields=['fix_draw_participant'])
         return Response({'detail': f'Fix draw set to {participant}.'})
+
+    @action(detail=True, methods=['post'], url_path='restore',
+        permission_classes=[IsSuperUser])
+    def restore(self, request, pk=None):
+        # Bypass get_queryset entirely — fetch directly
+        try:
+            vishi = Vishi.all_objects.get(pk=pk, is_deleted=True)
+        except Vishi.DoesNotExist:
+            return Response(
+                {'detail': 'Deleted vishi not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        vishi.is_deleted = False
+        vishi.deleted_at = None
+        vishi.save(update_fields=['is_deleted', 'deleted_at'])
+        # Re-activate ledgers for active participants
+        for participant in vishi.participants.filter(is_active=True):
+            CollectionLedger.objects.filter(
+                vishi=vishi, participant=participant
+            ).update(is_active=True)
+        return Response({'detail': 'Vishi restored.'})
 
 
 class VishiParticipantViewSet(viewsets.ModelViewSet):
@@ -443,24 +469,26 @@ class PaymentsSummaryView(APIView):
         by_vishi          = []
 
         for vishi in active_vishis:
-            # ← FIXED: was passing vishi (Vishi instance) directly into filter which caused
-            #   'int object has no attribute pk' — use vishi_id= to be explicit
             due_ledgers = CollectionLedger.objects.filter(
                 vishi_id=vishi.id, is_active=True, status='due'
+            ).select_related('participant', 'participant__user')
+
+            all_ledgers = CollectionLedger.objects.filter(
+                vishi_id=vishi.id, is_active=True
             ).select_related('participant', 'participant__user')
 
             vishi_total = sum(abs(l.balance) for l in due_ledgers)
             total_outstanding += vishi_total
             total_due_count   += due_ledgers.count()
 
-            if due_ledgers.exists():
-                by_vishi.append({
-                    'vishi_id':         vishi.id,
-                    'vishi_name':       vishi.name,
-                    'total_due':        vishi_total,
-                    'due_participants': due_ledgers.count(),
-                    'ledgers':          CollectionLedgerSerializer(due_ledgers, many=True).data,
-                })
+            # Always include — Quick Record needs all active vishis
+            by_vishi.append({
+                'vishi_id':         vishi.id,
+                'vishi_name':       vishi.name,
+                'total_due':        vishi_total,
+                'due_participants': due_ledgers.count(),
+                'ledgers':          CollectionLedgerSerializer(all_ledgers, many=True).data,
+            })
 
         data = {
             'total_outstanding': total_outstanding,

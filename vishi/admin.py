@@ -88,10 +88,14 @@ def force_charge(modeladmin, request, queryset):
 
 @admin.register(Vishi)
 class VishiAdmin(admin.ModelAdmin):
-    list_display  = ['name', 'amount', 'frequency', 'status', 'current_cycle', 'total_cycles']
-    list_filter   = ['status', 'frequency']
+    list_display  = ['name', 'amount', 'frequency', 'status', 'current_cycle', 'total_cycles', 'is_deleted']
+    list_filter   = ['status', 'frequency', 'is_deleted']
     search_fields = ['name']
-    actions       = [force_draw, force_release, force_skip, force_charge]   # ← add force_charge
+    actions       = [force_draw, force_release, force_skip, force_charge]
+ 
+    def get_queryset(self, request):
+        # Override to include soft-deleted vishis in Django admin
+        return Vishi.all_objects.all()
 
 
 @admin.register(VishiParticipant)
