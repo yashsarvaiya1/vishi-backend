@@ -62,17 +62,20 @@ class VishiParticipantAdminSerializer(serializers.ModelSerializer):
     def get_ledger_status(self, obj):
         ledger = obj.ledger.filter(is_active=True).first()
         return ledger.status if ledger else None
-
-
-
+ 
 class VishiParticipantPublicSerializer(serializers.ModelSerializer):
-    username     = serializers.CharField(source='user.username', read_only=True)
-    drawn_at     = serializers.SerializerMethodField()
-    cycle_number = serializers.SerializerMethodField()
+    username      = serializers.CharField(source='user.username', read_only=True)
+    user_id       = serializers.IntegerField(source='user.id', read_only=True)
+    drawn_at      = serializers.SerializerMethodField()
+    cycle_number  = serializers.SerializerMethodField()
+    ledger_balance = serializers.SerializerMethodField()   # ← ADD
+    ledger_status  = serializers.SerializerMethodField()   # ← ADD
 
     class Meta:
         model  = VishiParticipant
-        fields = ['id', 'vishi_name', 'username', 'is_drawn', 'is_active', 'drawn_at', 'cycle_number']
+        fields = ['id', 'vishi_name', 'username', 'user_id', 'is_drawn',
+                  'is_active', 'drawn_at', 'cycle_number',
+                  'ledger_balance', 'ledger_status']        # ← ADD both
 
     def get_drawn_at(self, obj):
         record = obj.draw_records.first()
@@ -81,6 +84,14 @@ class VishiParticipantPublicSerializer(serializers.ModelSerializer):
     def get_cycle_number(self, obj):
         record = obj.draw_records.first()
         return record.cycle_number if record else None
+
+    def get_ledger_balance(self, obj):                     # ← ADD
+        ledger = obj.ledger.filter(is_active=True).first()
+        return str(ledger.balance) if ledger else None
+
+    def get_ledger_status(self, obj):                      # ← ADD
+        ledger = obj.ledger.filter(is_active=True).first()
+        return ledger.status if ledger else None
 
 
 class VishiSerializer(serializers.ModelSerializer):
@@ -164,7 +175,7 @@ class PaymentVishiBreakdownSerializer(serializers.Serializer):
     vishi_name        = serializers.CharField()
     total_due         = serializers.DecimalField(max_digits=12, decimal_places=2)
     due_participants  = serializers.IntegerField()
-    ledgers           = CollectionLedgerSerializer(many=True)
+    ledgers           = serializers.ListField()
 
 
 class PaymentsSummarySerializer(serializers.Serializer):
