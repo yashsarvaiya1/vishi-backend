@@ -1,21 +1,32 @@
 # vishi/serializers.py
 
 from rest_framework import serializers
+from decimal import Decimal
 from .models import Vishi, VishiParticipant, VishiDrawRecord, CollectionLedger, PaymentEntry, SkipRecord
 from accounts.serializers import UserPublicSerializer
+from .services import validate_day_constraints, compute_dates, payment_settlement
 
 
 class PaymentEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model            = PaymentEntry
         fields           = '__all__'
-        read_only_fields = ['ledger', 'entry_type', 'cycle_number', 'recorded_by', 'created_at']
+        read_only_fields = ['ledger', 'entry_type', 'cycle_number', 'recorded_by', 'created_at', 'settlement']
+
+
+class RecordPaymentSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
+    note = serializers.CharField(required=False, allow_blank=True, default='')
 
 
 class CollectionLedgerSerializer(serializers.ModelSerializer):
     entries          = PaymentEntrySerializer(many=True, read_only=True)
     participant_name = serializers.CharField(source='participant.vishi_name', read_only=True)
     mobile_number    = serializers.CharField(source='participant.user.mobile_number', read_only=True)
+    late_amount      = serializers.SerializerMethodField()
+
+    def get_late_amount(self, obj):
+        return payment_settlement(obj, max(0, -obj.balance))['late_amount']
 
     class Meta:
         model            = CollectionLedger
@@ -103,6 +114,11 @@ class VishiParticipantPublicSerializer(serializers.ModelSerializer):
 
 
 class VishiSerializer(serializers.ModelSerializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
+    schedule_locked = serializers.SerializerMethodField()
+
+    def get_schedule_locked(self, obj):
+        return bool(obj.is_deleted or obj.status != 'upcoming' or obj.collection_cycle or obj.current_cycle or PaymentEntry.objects.filter(ledger__vishi=obj).exists())
     participants           = VishiParticipantAdminSerializer(many=True, read_only=True)
     draw_records           = VishiDrawRecordSerializer(many=True, read_only=True)
     pending_payments_count = serializers.SerializerMethodField()
@@ -110,7 +126,7 @@ class VishiSerializer(serializers.ModelSerializer):
     class Meta:
         model            = Vishi
         fields           = '__all__'
-        read_only_fields = ['current_draw_date', 'current_collection_date', 'current_release_date',
+        read_only_fields = ['current_draw_date', 'current_collection_date', 'current_release_date', 'next_renewal_date',
                             'finish_date', 'total_cycles', 'current_cycle', 'collection_cycle', 'missed_cycles',
                             'status', 'fix_draw_participant', 'created_by', 'created_at',
                             'updated_at', 'is_deleted', 'deleted_at']
@@ -119,14 +135,28 @@ class VishiSerializer(serializers.ModelSerializer):
         return obj.ledgers.filter(is_active=True, status='due').count()
 
     def validate(self, data):
-        # FIXED: wrap error string in list so DRF returns {"non_field_errors": [...]}
-        if self.instance and self.instance.status == 'active':
-            locked = ['amount', 'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date']
-            for field in locked:
-                if field in data:
+        locked = ['amount', 'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date']
+        changed = [field for field in locked if field in data and
+                   (not self.instance or data[field] != getattr(self.instance, field))]
+        if self.instance:
+            if self.instance.is_deleted:
+                raise serializers.ValidationError('Restore the vishi before editing it.')
+            has_history = self.instance.collection_cycle or self.instance.current_cycle or PaymentEntry.objects.filter(ledger__vishi=self.instance).exists()
+            if self.instance.status != 'upcoming' or has_history:
+                for field in changed:
                     raise serializers.ValidationError(
-                        {field: f'"{field}" cannot be changed on an active vishi.'}
+                        {field: f'"{field}" cannot be changed after the vishi has started or has payment history.'}
                     )
+        schedule = ['frequency', 'draw_day', 'collection_day', 'release_day', 'start_date']
+        if not self.instance or changed:
+            values = {field: data.get(field, getattr(self.instance, field, None)) for field in schedule}
+            error = validate_day_constraints(values['draw_day'], values['collection_day'], values['release_day'], values['frequency'])
+            if error:
+                raise serializers.ValidationError({'non_field_errors': [error]})
+            dates = compute_dates(**values)
+            for field in ['current_draw_date', 'current_collection_date', 'current_release_date']:
+                if dates[field] < values['start_date']:
+                    raise serializers.ValidationError({'start_date': 'Start date must not be after the first draw, collection or release date.'})
         return data
 
 
@@ -137,7 +167,7 @@ class VishiPublicSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Vishi
         fields = ['id', 'name', 'amount', 'frequency', 'current_draw_date',
-                  'current_collection_date', 'current_release_date', 'start_date',
+                  'current_collection_date', 'current_release_date', 'next_renewal_date', 'start_date',
                   'finish_date', 'status', 'current_cycle', 'collection_cycle', 'total_cycles',
                   'participants', 'draw_records']
 

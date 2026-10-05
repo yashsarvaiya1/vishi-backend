@@ -3,6 +3,7 @@
 from datetime import date, timedelta
 from decimal import Decimal
 from django.db import transaction
+from django.utils import timezone
 
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, status, filters
@@ -22,7 +23,7 @@ from .serializers import (
     DashboardSerializer, PaymentsSummarySerializer,
     UserParticipationSlotSerializer,
     MyVishiGroupedSerializer, MyPaymentVishiSerializer,
-    DrawOptionsSerializer,
+    DrawOptionsSerializer, RecordPaymentSerializer,
 )
 from .permissions import IsSuperUser, IsAuthenticatedReadOrSuperUserWrite
 from .services import (
@@ -82,23 +83,45 @@ class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
             raise ValidationError({'non_field_errors': [error]})
 
         dates        = compute_dates(start_date, draw_day, collection_day, release_day, frequency)
-        vishi_status = 'active' if start_date <= date.today() else 'upcoming'
+        vishi_status = 'active' if start_date <= timezone.localdate() else 'upcoming'
 
         serializer.save(
             created_by              = self.request.user,
             current_draw_date       = dates['current_draw_date'],
             current_collection_date = dates['current_collection_date'],
             current_release_date    = dates['current_release_date'],
+            next_renewal_date       = dates['next_renewal_date'],
             finish_date             = start_date,
             total_cycles            = 0,
             status                  = vishi_status,
         )
 
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        # Lock before validation so concurrent activation/payment cannot bypass it.
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        instance = Vishi.all_objects.select_for_update().get(pk=instance.pk)
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
     def perform_update(self, serializer):
+        schedule = {'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date'}
+        reschedule = any(field in serializer.validated_data and
+                         serializer.validated_data[field] != getattr(serializer.instance, field)
+                         for field in schedule)
         vishi = serializer.save()
-        if not vishi.collection_cycle:
-            vishi.current_collection_date = vishi.start_date
-            vishi.save(update_fields=['current_collection_date'])
+        if vishi.status == 'upcoming' and reschedule:
+            dates = compute_dates(vishi.start_date, vishi.draw_day, vishi.collection_day, vishi.release_day, vishi.frequency)
+            for field, value in dates.items():
+                setattr(vishi, field, value)
+            vishi.finish_date = compute_finish_date(vishi.start_date, vishi.total_cycles, vishi.frequency)
+            vishi.status = 'active' if vishi.start_date <= timezone.localdate() else 'upcoming'
+            vishi.save(update_fields=[*dates, 'finish_date', 'status'])
+            if vishi.start_date <= timezone.localdate():
+                charge_vishi(vishi)
 
     def destroy(self, request, *args, **kwargs):
         vishi = self.get_object()
@@ -365,17 +388,9 @@ class CollectionLedgerViewSet(CollectionSyncMixin, viewsets.ReadOnlyModelViewSet
             permission_classes=[IsSuperUser])
     def record_payment_action(self, request, vishi_pk=None, pk=None):
         ledger = self.get_object()
-        amount = request.data.get('amount')
-        note   = request.data.get('note', '')
-        if not amount:
-            return Response({'detail': 'Amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            amount = Decimal(str(amount))
-            if amount <= 0:
-                raise ValueError
-        except (ValueError, Exception):
-            return Response({'detail': 'Amount must be a positive number.'}, status=status.HTTP_400_BAD_REQUEST)
-        updated = record_payment(ledger, amount, note, request.user)
+        payload = RecordPaymentSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        updated = record_payment(ledger, payload.validated_data['amount'], payload.validated_data['note'], request.user)
         return Response(CollectionLedgerSerializer(updated).data)
 
 

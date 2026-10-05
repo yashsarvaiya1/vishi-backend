@@ -1,6 +1,8 @@
 # vishi/services.py
 
 import random
+from collections import deque
+from calendar import monthrange
 from datetime import date, timedelta
 from decimal import Decimal
 from dateutil.relativedelta import relativedelta
@@ -26,16 +28,19 @@ MONTH_BASED = ('monthly', 'halfyear', 'yearly')
 
 def compute_dates(start_date, draw_day, collection_day, release_day, frequency):
     if frequency in MONTH_BASED:
+        draw_date = start_date.replace(day=draw_day)
         return {
-            'current_draw_date':       start_date.replace(day=draw_day),
-            'current_collection_date': start_date,
-            'current_release_date':    start_date.replace(day=release_day),
+            'current_draw_date':       draw_date,
+            'current_collection_date': collection_deadline(start_date, collection_day, frequency),
+            'current_release_date':    draw_date.replace(day=release_day),
+            'next_renewal_date':       start_date,
         }
     else:
         return {
             'current_draw_date':       start_date + timedelta(days=draw_day - 1),
-            'current_collection_date': start_date,
+            'current_collection_date': collection_deadline(start_date, collection_day, frequency),
             'current_release_date':    start_date + timedelta(days=release_day - 1),
+            'next_renewal_date':       start_date,
         }
 
 
@@ -49,21 +54,30 @@ def advance_date(current_date, frequency):
 
 
 def validate_day_constraints(draw_day, collection_day, release_day, frequency):
-    if not (draw_day < collection_day < release_day):
-        return 'draw_day must be < collection_day < release_day.'
-
-    if frequency == 'weekly' and (release_day - draw_day) > 7:
-        return 'For weekly frequency, release_day - draw_day must be ≤ 7.'
-
-    if frequency == 'half_monthly' and (release_day - draw_day) > 14:
-        return 'For half_monthly frequency, release_day - draw_day must be ≤ 14.'
-
-    if frequency in MONTH_BASED:
-        for label, val in [('draw_day', draw_day), ('collection_day', collection_day), ('release_day', release_day)]:
-            if not (1 <= val <= 28):
-                return f'{label} must be between 1 and 28 for {frequency} frequency.'
+    maximum = {'weekly': 7, 'half_monthly': 14}.get(frequency, 28)
+    for label, val in [('draw_day', draw_day), ('collection_day', collection_day), ('release_day', release_day)]:
+        if not (1 <= val <= maximum):
+            return f'{label} must be between 1 and {maximum} for {frequency} frequency.'
+    if draw_day >= release_day:
+        return 'Draw day must be before release day.'
+    if collection_day >= release_day:
+        return 'Collection day must be before release day.'
 
     return None
+
+
+def collection_deadline(period_start, collection_day, frequency):
+    if frequency in MONTH_BASED:
+        # Tolerate invalid legacy edits when reading/migrating existing data.
+        # New schedules are validated strictly before saving.
+        day = max(1, min(collection_day, monthrange(period_start.year, period_start.month)[1]))
+        deadline = period_start.replace(day=day)
+        return deadline
+    return period_start + timedelta(days=collection_day - 1)
+
+
+def period_deadline(vishi, cycle_number):
+    return collection_deadline(collection_date(vishi, max(1, cycle_number)), vishi.collection_day, vishi.frequency)
 
 
 def collection_date(vishi, cycle_number):
@@ -97,24 +111,26 @@ def charge_vishi(vishi, today=None):
                 continue
             charge_participant(ledger, cycle, None)
     locked.collection_cycle = max(locked.collection_cycle, due_cycle)
-    locked.current_collection_date = collection_date(locked, locked.collection_cycle + 1)
+    locked.next_renewal_date = collection_date(locked, locked.collection_cycle + 1)
+    locked.current_collection_date = period_deadline(locked, locked.collection_cycle)
     if locked.status == 'upcoming':
         locked.status = 'active'
-    locked.save(update_fields=['collection_cycle', 'current_collection_date', 'status'])
+    locked.save(update_fields=['collection_cycle', 'current_collection_date', 'next_renewal_date', 'status'])
     vishi.collection_cycle = locked.collection_cycle
     vishi.current_collection_date = locked.current_collection_date
+    vishi.next_renewal_date = locked.next_renewal_date
     vishi.status = locked.status
 
 
 def sync_collections(user=None, vishi_id=None):
     today = timezone.localdate()
-    vishis = Vishi.objects.filter(current_collection_date__lte=today)
+    vishis = Vishi.objects.filter(start_date__lte=today)
     if vishi_id is not None:
         vishis = vishis.filter(pk=vishi_id)
     if user is not None and not user.is_superuser:
         vishis = vishis.filter(participants__user=user, participants__is_active=True).distinct()
     for vishi in vishis:
-        if vishi.collection_cycle < vishi.total_cycles:
+        if vishi.collection_cycle < vishi.total_cycles and (vishi.next_renewal_date is None or vishi.next_renewal_date <= today):
             charge_vishi(vishi, today)
 
 
@@ -188,6 +204,7 @@ def perform_skip(vishi, is_auto=False, reason=''):
 def record_payment(ledger, amount, note, recorded_by):
     charge_vishi(ledger.vishi)
     ledger = CollectionLedger.objects.select_for_update().select_related('vishi').get(pk=ledger.pk)
+    settlement = payment_settlement(ledger, Decimal(str(amount)))
     ledger.balance      += Decimal(str(amount))
     ledger.last_paid_at  = timezone.now()
     ledger.update_status()
@@ -200,8 +217,58 @@ def record_payment(ledger, amount, note, recorded_by):
         cycle_number = current_collection_cycle(ledger.vishi),
         note         = note,
         recorded_by  = recorded_by,
+        settlement   = settlement,
     )
     return ledger
+
+
+def outstanding_payments(ledger):
+    """Replay credits FIFO without changing the authoritative ledger balance."""
+    outstanding = deque()
+    advance = Decimal('0')
+    for entry in sorted(ledger.entries.all(), key=lambda entry: (entry.created_at, entry.pk)):
+        if entry.amount < 0:
+            debt = -entry.amount
+            used = min(advance, debt)
+            advance -= used
+            if debt > used:
+                outstanding.append([entry.cycle_number, debt - used])
+        else:
+            credit = entry.amount
+            while credit > 0 and outstanding:
+                used = min(credit, outstanding[0][1])
+                credit -= used
+                outstanding[0][1] -= used
+                if outstanding[0][1] == 0:
+                    outstanding.popleft()
+            advance += credit
+    return outstanding
+
+
+def payment_settlement(ledger, amount, today=None):
+    today = today or timezone.localdate()
+    debt_remaining = max(Decimal('0'), -ledger.balance)
+    remaining = amount
+    late = Decimal('0')
+    due = Decimal('0')
+    for cycle, debt in outstanding_payments(ledger):
+        used = min(debt, remaining, debt_remaining)
+        if today > period_deadline(ledger.vishi, cycle):
+            late += used
+        else:
+            due += used
+        remaining -= used
+        debt_remaining -= used
+        if remaining <= 0 or debt_remaining <= 0:
+            break
+    # Legacy adjustments without entry history still settle the actual balance.
+    used = min(remaining, debt_remaining)
+    if today > ledger.vishi.current_collection_date:
+        late += used
+    else:
+        due += used
+    remaining -= used
+    return {'late_amount': f'{late:.2f}', 'due_amount': f'{due:.2f}', 'advance_amount': f'{remaining:.2f}'}
 
 # Add these two functions to the bottom of vishi/services.py
 # (after record_payment)
@@ -214,6 +281,7 @@ def charge_participant(ledger, cycle_number, recorded_by):
     Used when a participant was added late or missed the auto-charge.
     Idempotent guard: raises ValueError if already charged for this cycle.
     """
+    vishi = Vishi.all_objects.select_for_update().get(pk=ledger.vishi_id)
     ledger = CollectionLedger.objects.select_for_update().get(pk=ledger.pk)
     already = PaymentEntry.objects.filter(
         ledger=ledger, entry_type='charge', cycle_number=cycle_number
@@ -221,7 +289,6 @@ def charge_participant(ledger, cycle_number, recorded_by):
     if already:
         raise ValueError(f'Participant already charged for cycle {cycle_number}.')
 
-    vishi = ledger.vishi
     ledger.balance        -= vishi.amount
     ledger.last_charged_at = timezone.now()
     ledger.update_status()
@@ -245,6 +312,7 @@ def waive_participant(ledger, cycle_number, note, recorded_by):
     the vishi amount. Creates a 'payment' entry marked as waiver.
     Idempotent guard: raises ValueError if already waived for this cycle.
     """
+    vishi = Vishi.all_objects.select_for_update().get(pk=ledger.vishi_id)
     ledger = CollectionLedger.objects.select_for_update().get(pk=ledger.pk)
     already = PaymentEntry.objects.filter(
         ledger=ledger, entry_type='payment',
@@ -253,7 +321,6 @@ def waive_participant(ledger, cycle_number, note, recorded_by):
     if already:
         raise ValueError(f'Participant already waived for cycle {cycle_number}.')
 
-    vishi = ledger.vishi
     ledger.balance     += vishi.amount
     ledger.last_paid_at = timezone.now()
     ledger.update_status()

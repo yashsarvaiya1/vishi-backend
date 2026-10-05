@@ -31,6 +31,7 @@ class Vishi(models.Model):
     release_day             = models.PositiveSmallIntegerField()
     current_draw_date       = models.DateField()
     current_collection_date = models.DateField()
+    next_renewal_date        = models.DateField(null=True, blank=True)
     current_release_date    = models.DateField()
     start_date              = models.DateField()
     finish_date             = models.DateField()
@@ -145,6 +146,7 @@ class PaymentEntry(models.Model):
     entry_type   = models.CharField(max_length=20, choices=ENTRY_TYPE_CHOICES)
     cycle_number = models.PositiveIntegerField()
     note         = models.TextField(blank=True)
+    settlement   = models.JSONField(null=True, blank=True)
     recorded_by  = models.ForeignKey(
         User, null=True, blank=True,
         on_delete=models.SET_NULL, related_name='payment_entries'
