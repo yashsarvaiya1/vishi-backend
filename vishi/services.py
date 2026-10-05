@@ -28,11 +28,20 @@ MONTH_BASED = ('monthly', 'halfyear', 'yearly')
 
 def compute_dates(start_date, draw_day, collection_day, release_day, frequency):
     if frequency in MONTH_BASED:
-        draw_date = start_date.replace(day=draw_day)
+        def next_occurrence(day, earliest):
+            month = start_date.replace(day=1)
+            while True:
+                candidate = month.replace(day=min(day, monthrange(month.year, month.month)[1]))
+                if candidate >= earliest:
+                    return candidate
+                month += relativedelta(months=1)
+        draw_date = next_occurrence(draw_day, start_date)
+        deadline = next_occurrence(collection_day, start_date)
+        release_date = next_occurrence(release_day, max(draw_date, deadline) + timedelta(days=1))
         return {
             'current_draw_date':       draw_date,
-            'current_collection_date': collection_deadline(start_date, collection_day, frequency),
-            'current_release_date':    draw_date.replace(day=release_day),
+            'current_collection_date': deadline,
+            'current_release_date':    release_date,
             'next_renewal_date':       start_date,
         }
     else:
@@ -54,16 +63,40 @@ def advance_date(current_date, frequency):
 
 
 def validate_day_constraints(draw_day, collection_day, release_day, frequency):
-    maximum = {'weekly': 7, 'half_monthly': 14}.get(frequency, 28)
+    maximum = {'weekly': 7, 'half_monthly': 14}.get(frequency, 31)
     for label, val in [('draw_day', draw_day), ('collection_day', collection_day), ('release_day', release_day)]:
         if not (1 <= val <= maximum):
             return f'{label} must be between 1 and {maximum} for {frequency} frequency.'
-    if draw_day >= release_day:
+    if frequency not in MONTH_BASED and draw_day >= release_day:
         return 'Draw day must be before release day.'
-    if collection_day >= release_day:
+    if frequency not in MONTH_BASED and collection_day >= release_day:
         return 'Collection day must be before release day.'
 
     return None
+
+
+def validate_date_schedule(start_date, draw_date, collection_date, release_date, frequency):
+    renewal = start_date + FREQUENCY_DELTA[frequency]
+    for label, value in [('Draw', draw_date), ('Collection', collection_date), ('Release', release_date)]:
+        if value < start_date or value >= renewal:
+            return f'{label} date must be on or after the start date and before the next renewal ({renewal:%d/%m/%y}).'
+    if release_date <= draw_date or release_date <= collection_date:
+        return 'Release date must be after both draw and collection dates.'
+    return None
+
+
+def advance_event_date(vishi, field, current_date):
+    """Advance from the original date to prevent Jan31 -> Feb28 -> Mar28 drift."""
+    anchor = getattr(vishi, field)
+    if anchor is None:
+        return advance_date(current_date, vishi.frequency)
+    delta = FREQUENCY_DELTA[vishi.frequency]
+    period = 0
+    while anchor + delta * period < current_date:
+        period += 1
+    if anchor + delta * period != current_date:
+        return advance_date(current_date, vishi.frequency)
+    return anchor + delta * (period + 1)
 
 
 def collection_deadline(period_start, collection_day, frequency):
@@ -77,6 +110,8 @@ def collection_deadline(period_start, collection_day, frequency):
 
 
 def period_deadline(vishi, cycle_number):
+    if vishi.collection_date is not None:
+        return vishi.collection_date + FREQUENCY_DELTA[vishi.frequency] * (max(1, cycle_number) - 1)
     return collection_deadline(collection_date(vishi, max(1, cycle_number)), vishi.collection_day, vishi.frequency)
 
 
@@ -163,7 +198,7 @@ def perform_draw(vishi, hide_fixed=False):
 
     vishi.current_cycle       += 1
     vishi.fix_draw_participant = None
-    vishi.current_draw_date    = advance_date(vishi.current_draw_date, vishi.frequency)
+    vishi.current_draw_date    = advance_event_date(vishi, 'draw_date', vishi.current_draw_date)
 
     if vishi.current_cycle >= vishi.total_cycles:
         vishi.status = 'completed'
@@ -185,14 +220,14 @@ def perform_release(vishi):
     record.released_amount = vishi.amount * active_count
     record.save()
 
-    vishi.current_release_date = advance_date(vishi.current_release_date, vishi.frequency)
+    vishi.current_release_date = advance_event_date(vishi, 'release_date', vishi.current_release_date)
     vishi.save()
     return record, None
 
 
 def perform_skip(vishi, is_auto=False, reason=''):
-    vishi.current_draw_date       = advance_date(vishi.current_draw_date,       vishi.frequency)
-    vishi.current_release_date    = advance_date(vishi.current_release_date,    vishi.frequency)
+    vishi.current_draw_date       = advance_event_date(vishi, 'draw_date', vishi.current_draw_date)
+    vishi.current_release_date    = advance_event_date(vishi, 'release_date', vishi.current_release_date)
     vishi.finish_date             = advance_date(vishi.finish_date,             vishi.frequency)
     vishi.missed_cycles          += 1
     vishi.save()

@@ -27,7 +27,7 @@ from .serializers import (
 )
 from .permissions import IsSuperUser, IsAuthenticatedReadOrSuperUserWrite
 from .services import (
-    compute_dates, compute_finish_date, validate_day_constraints,
+    compute_finish_date,
     perform_draw, perform_release, perform_skip, record_payment,
     charge_participant, waive_participant,
     charge_vishi, sync_collections, current_collection_cycle,
@@ -72,17 +72,13 @@ class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
     def perform_create(self, serializer):
-        start_date     = serializer.validated_data['start_date']
-        frequency      = serializer.validated_data['frequency']
-        draw_day       = serializer.validated_data['draw_day']
-        collection_day = serializer.validated_data['collection_day']
-        release_day    = serializer.validated_data['release_day']
-
-        error = validate_day_constraints(draw_day, collection_day, release_day, frequency)
-        if error:
-            raise ValidationError({'non_field_errors': [error]})
-
-        dates        = compute_dates(start_date, draw_day, collection_day, release_day, frequency)
+        start_date = serializer.validated_data['start_date']
+        dates = {
+            'current_draw_date': serializer.validated_data['draw_date'],
+            'current_collection_date': serializer.validated_data['collection_date'],
+            'current_release_date': serializer.validated_data['release_date'],
+            'next_renewal_date': start_date,
+        }
         vishi_status = 'active' if start_date <= timezone.localdate() else 'upcoming'
 
         serializer.save(
@@ -108,13 +104,14 @@ class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def perform_update(self, serializer):
-        schedule = {'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date'}
+        schedule = {'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date', 'draw_date', 'collection_date', 'release_date'}
         reschedule = any(field in serializer.validated_data and
                          serializer.validated_data[field] != getattr(serializer.instance, field)
                          for field in schedule)
         vishi = serializer.save()
         if vishi.status == 'upcoming' and reschedule:
-            dates = compute_dates(vishi.start_date, vishi.draw_day, vishi.collection_day, vishi.release_day, vishi.frequency)
+            dates = {'current_draw_date': vishi.draw_date, 'current_collection_date': vishi.collection_date,
+                     'current_release_date': vishi.release_date, 'next_renewal_date': vishi.start_date}
             for field, value in dates.items():
                 setattr(vishi, field, value)
             vishi.finish_date = compute_finish_date(vishi.start_date, vishi.total_cycles, vishi.frequency)

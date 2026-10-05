@@ -272,7 +272,7 @@ class CollectionMigrationTests(TransactionTestCase):
         )
         try:
             executor = MigrationExecutor(connection)
-            executor.migrate([('vishi', '0006_collection_deadlines_payment_settlement')])
+            executor.migrate([('vishi', '0007_vishi_schedule_dates')])
             vishi = Vishi.objects.get(pk=vishi.pk)
             ledger = CollectionLedger.objects.get(pk=ledger.pk)
             self.assertEqual(vishi.collection_cycle, 1)
@@ -285,7 +285,7 @@ class CollectionMigrationTests(TransactionTestCase):
             self.assertEqual(ledger.balance, -600)
             self.assertEqual(ledger.entries.count(), 2)
         finally:
-            MigrationExecutor(connection).migrate([('vishi', '0006_collection_deadlines_payment_settlement')])
+            MigrationExecutor(connection).migrate([('vishi', '0007_vishi_schedule_dates')])
 
 
 class FixedDrawVisibilityTests(TestCase):
@@ -599,7 +599,7 @@ class DeadlineAndEditTests(CollectionTestCase):
 class DeadlineMigrationTests(TransactionTestCase):
     def test_upgrade_from_deployed_collection_cursor_preserves_all_money_and_history(self):
         previous = [('vishi', '0005_vishidrawrecord_hide_fixed')]
-        latest = [('vishi', '0006_collection_deadlines_payment_settlement')]
+        latest = [('vishi', '0007_vishi_schedule_dates')]
         executor = MigrationExecutor(connection)
         executor.migrate(previous)
         old = executor.loader.project_state(previous).apps
@@ -634,5 +634,186 @@ class DeadlineMigrationTests(TransactionTestCase):
             ledger.refresh_from_db()
             self.assertEqual(ledger.balance, -600)
             self.assertEqual(ledger.entries.count(), 2)
+        finally:
+            MigrationExecutor(connection).migrate(latest)
+
+
+class ExplicitScheduleTests(CollectionTestCase):
+    def payload(self, **changes):
+        values = dict(name='Date schedule', amount='1000', frequency='monthly',
+                      start_date='2026-10-10', draw_date='2026-10-20',
+                      collection_date='2026-11-01', release_date='2026-11-05')
+        values.update(changes)
+        return values
+
+    def create(self, **changes):
+        return self.client.post('/api/vishis/', self.payload(**changes), format='json')
+
+    def test_cross_month_collection_and_release_inside_cycle(self):
+        response = self.create()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['current_draw_date'], '2026-10-20')
+        self.assertEqual(response.data['current_collection_date'], '2026-11-01')
+        self.assertEqual(response.data['current_release_date'], '2026-11-05')
+        self.assertEqual(response.data['collection_date'], '2026-11-01')
+        self.assertEqual(response.data['collection_day'], 1)
+
+    def test_collection_before_draw_and_collection_on_draw(self):
+        for deadline in ['2026-10-15', '2026-10-20']:
+            response = self.create(collection_date=deadline)
+            self.assertEqual(response.status_code, 201, response.data)
+
+    def test_invalid_dates_and_partial_dates_are_rejected(self):
+        for values in [dict(collection_date='2026-10-09'), dict(draw_date='2026-10-09'),
+                       dict(release_date='2026-11-10'), dict(collection_date='2026-11-10'),
+                       dict(draw_date='2026-11-11'), dict(release_date='2026-10-19'),
+                       dict(release_date='2026-11-01'), dict(collection_date=None),
+                       dict(draw_date='2026-02-30'), dict(draw_day=20),
+                       dict(frequency='weekly'), dict(frequency='half_monthly')]:
+            with self.subTest(values=values):
+                response = self.create(**values)
+                self.assertEqual(response.status_code, 400, response.data)
+        payload = self.payload()
+        payload.pop('collection_date')
+        response = self.client.post('/api/vishis/', payload, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertFalse(Vishi.objects.exists())
+
+    def test_all_frequency_windows(self):
+        for frequency, draw, collect, release in [
+            ('weekly', '2026-10-11', '2026-10-12', '2026-10-16'),
+            ('half_monthly', '2026-10-15', '2026-10-11', '2026-10-23'),
+            ('halfyear', '2026-12-20', '2027-03-01', '2027-04-09'),
+            ('yearly', '2027-01-20', '2027-09-01', '2027-10-09'),
+        ]:
+            with self.subTest(frequency=frequency):
+                response = self.create(frequency=frequency, draw_date=draw, collection_date=collect, release_date=release)
+                self.assertEqual(response.status_code, 201, response.data)
+
+    def test_future_edit_updates_explicit_dates_and_validates_merged_values(self):
+        response = self.create(start_date='2026-11-10', draw_date='2026-11-20', collection_date='2026-12-01', release_date='2026-12-05')
+        self.assertEqual(response.status_code, 201, response.data)
+        pk = response.data['id']
+        response = self.client.patch(f'/api/vishis/{pk}/', {'collection_date': '2026-11-15'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['current_collection_date'], '2026-11-15')
+        response = self.client.patch(f'/api/vishis/{pk}/', {'release_date': '2026-11-19'}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+        response = self.client.patch(f'/api/vishis/{pk}/', {'frequency': 'weekly'}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+        response = self.client.patch(f'/api/vishis/{pk}/', {'collection_day': 10}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_existing_future_schedule_can_switch_to_dates(self):
+        vishi = self.make_vishi(start=date(2026, 11, 5), status='upcoming')
+        response = self.client.patch(f'/api/vishis/{vishi.pk}/',
+            dict(draw_date='2026-11-15', collection_date='2026-12-01', release_date='2026-12-03'), format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['current_collection_date'], '2026-12-01')
+        self.assertEqual(response.data['collection_date'], '2026-12-01')
+
+    def test_started_and_prepaid_explicit_schedules_stay_locked(self):
+        response = self.create()
+        vishi = Vishi.objects.get(pk=response.data['id'])
+        ledger = self.make_ledger(vishi, joined=self.today)
+        record_payment(ledger, 1000, '', self.admin)
+        response = self.client.patch(f'/api/vishis/{vishi.pk}/', {'collection_date': '2026-10-30'}, format='json')
+        self.assertEqual(response.status_code, 400, response.data)
+
+    def test_cross_month_late_payment_and_start_renewal(self):
+        response = self.create()
+        vishi = Vishi.objects.get(pk=response.data['id'])
+        vishi.total_cycles = 3
+        vishi.save(update_fields=['total_cycles'])
+        ledger = self.make_ledger(vishi, joined=self.today)
+        self.today = date(2026, 10, 10)
+        charge_collection()
+        self.today = date(2026, 11, 1)
+        record_payment(ledger, 400, '', self.admin)
+        self.assertEqual(ledger.entries.filter(entry_type='payment').last().settlement['due_amount'], '400.00')
+        self.today = date(2026, 11, 2)
+        record_payment(ledger, 600, '', self.admin)
+        self.assertEqual(ledger.entries.filter(entry_type='payment').last().settlement['late_amount'], '600.00')
+        self.today = date(2026, 11, 10)
+        charge_collection()
+        vishi.refresh_from_db()
+        ledger.refresh_from_db()
+        self.assertEqual(vishi.current_collection_date, date(2026, 12, 1))
+        self.assertEqual(vishi.next_renewal_date, date(2026, 12, 10))
+        self.assertEqual(ledger.balance, -1000)
+        self.assertEqual(ledger.entries.filter(entry_type='charge').count(), 2)
+
+    def test_draw_release_and_skip_advance_frequency_without_charging_twice(self):
+        from .services import perform_release
+        response = self.create()
+        vishi = Vishi.objects.get(pk=response.data['id'])
+        vishi.total_cycles = 3
+        vishi.save(update_fields=['total_cycles'])
+        ledger = self.make_ledger(vishi, joined=self.today)
+        self.today = date(2026, 10, 20)
+        perform_draw(vishi)
+        self.assertEqual(vishi.current_draw_date, date(2026, 11, 20))
+        perform_release(vishi)
+        self.assertEqual(vishi.current_release_date, date(2026, 12, 5))
+        perform_skip(vishi)
+        self.assertEqual(vishi.current_draw_date, date(2026, 12, 20))
+        self.assertEqual(vishi.current_release_date, date(2027, 1, 5))
+        self.assertEqual(vishi.current_collection_date, date(2026, 11, 1))
+        self.assertEqual(ledger.entries.filter(entry_type='charge').count(), 1)
+
+    def test_month_end_and_leap_dates_do_not_drift(self):
+        from .services import advance_event_date, period_deadline
+        response = self.create(start_date='2028-01-01', draw_date='2028-01-29', collection_date='2028-01-30', release_date='2028-01-31')
+        self.assertEqual(response.status_code, 201, response.data)
+        vishi = Vishi.objects.get(pk=response.data['id'])
+        next_draw = advance_event_date(vishi, 'draw_date', vishi.draw_date)
+        self.assertEqual(next_draw, date(2028, 2, 29))
+        self.assertEqual(advance_event_date(vishi, 'draw_date', next_draw), date(2028, 3, 29))
+        next_release = advance_event_date(vishi, 'release_date', vishi.release_date)
+        self.assertEqual(next_release, date(2028, 2, 29))
+        self.assertEqual(advance_event_date(vishi, 'release_date', next_release), date(2028, 3, 31))
+        self.assertEqual(period_deadline(vishi, 2), date(2028, 2, 29))
+        self.assertEqual(period_deadline(vishi, 3), date(2028, 3, 30))
+
+    def test_legacy_day_request_wraps_smaller_day_to_next_month(self):
+        response = self.client.post('/api/vishis/',
+            dict(name='Compatibility', amount='1000', frequency='monthly', start_date='2026-10-10',
+                 draw_day=20, collection_day=1, release_day=5), format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['collection_date'], '2026-11-01')
+        self.assertEqual(response.data['release_date'], '2026-11-05')
+
+
+class ExplicitScheduleMigrationTests(TransactionTestCase):
+    def test_upgrade_keeps_live_dates_balances_and_settlement_history_unchanged(self):
+        previous = [('vishi', '0006_collection_deadlines_payment_settlement')]
+        latest = [('vishi', '0007_vishi_schedule_dates')]
+        executor = MigrationExecutor(connection)
+        executor.migrate(previous)
+        old = executor.loader.project_state(previous).apps
+        user = old.get_model('accounts', 'User').objects.create(mobile_number='7777777777')
+        vishi = old.get_model('vishi', 'Vishi').objects.create(
+            name='Live dates', amount=1000, frequency='monthly', start_date=date(2026, 10, 5),
+            draw_day=15, collection_day=20, release_day=22, total_cycles=3, collection_cycle=1,
+            current_cycle=1, missed_cycles=1, status='active', created_by=user,
+            current_draw_date=date(2026, 12, 15), current_collection_date=date(2026, 10, 20),
+            current_release_date=date(2026, 11, 22), next_renewal_date=date(2026, 11, 5), finish_date=date(2027, 2, 5),
+        )
+        p = old.get_model('vishi', 'VishiParticipant').objects.create(vishi=vishi, user=user)
+        ledger = old.get_model('vishi', 'CollectionLedger').objects.create(vishi=vishi, participant=p, balance=-600, status='due')
+        settlement = {'late_amount': '400.00', 'due_amount': '0.00', 'advance_amount': '0.00'}
+        entry = old.get_model('vishi', 'PaymentEntry').objects.create(ledger=ledger, amount=400, entry_type='payment', cycle_number=1, settlement=settlement)
+        try:
+            MigrationExecutor(connection).migrate(latest)
+            vishi = Vishi.objects.get(pk=vishi.pk)
+            self.assertEqual(vishi.current_draw_date, date(2026, 12, 15))
+            self.assertEqual(vishi.current_collection_date, date(2026, 10, 20))
+            self.assertEqual(vishi.current_release_date, date(2026, 11, 22))
+            self.assertEqual(vishi.next_renewal_date, date(2026, 11, 5))
+            self.assertIsNone(vishi.draw_date)
+            self.assertIsNone(vishi.collection_date)
+            self.assertIsNone(vishi.release_date)
+            self.assertEqual(CollectionLedger.objects.get(pk=ledger.pk).balance, -600)
+            self.assertEqual(PaymentEntry.objects.get(pk=entry.pk).settlement, settlement)
         finally:
             MigrationExecutor(connection).migrate(latest)

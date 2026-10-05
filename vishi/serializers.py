@@ -4,7 +4,7 @@ from rest_framework import serializers
 from decimal import Decimal
 from .models import Vishi, VishiParticipant, VishiDrawRecord, CollectionLedger, PaymentEntry, SkipRecord
 from accounts.serializers import UserPublicSerializer
-from .services import validate_day_constraints, compute_dates, payment_settlement
+from .services import validate_day_constraints, compute_dates, payment_settlement, validate_date_schedule, MONTH_BASED
 
 
 class PaymentEntrySerializer(serializers.ModelSerializer):
@@ -114,6 +114,9 @@ class VishiParticipantPublicSerializer(serializers.ModelSerializer):
 
 
 class VishiSerializer(serializers.ModelSerializer):
+    draw_date = serializers.DateField(required=False)
+    collection_date = serializers.DateField(required=False)
+    release_date = serializers.DateField(required=False)
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
     schedule_locked = serializers.SerializerMethodField()
 
@@ -126,6 +129,7 @@ class VishiSerializer(serializers.ModelSerializer):
     class Meta:
         model            = Vishi
         fields           = '__all__'
+        extra_kwargs = {field: {'required': False} for field in ['draw_day', 'collection_day', 'release_day']}
         read_only_fields = ['current_draw_date', 'current_collection_date', 'current_release_date', 'next_renewal_date',
                             'finish_date', 'total_cycles', 'current_cycle', 'collection_cycle', 'missed_cycles',
                             'status', 'fix_draw_participant', 'created_by', 'created_at',
@@ -135,7 +139,10 @@ class VishiSerializer(serializers.ModelSerializer):
         return obj.ledgers.filter(is_active=True, status='due').count()
 
     def validate(self, data):
-        locked = ['amount', 'frequency', 'draw_day', 'collection_day', 'release_day', 'start_date']
+        date_fields = ['draw_date', 'collection_date', 'release_date']
+        day_fields = ['draw_day', 'collection_day', 'release_day']
+        schedule = ['frequency', 'start_date', *date_fields, *day_fields]
+        locked = ['amount', *schedule]
         changed = [field for field in locked if field in data and
                    (not self.instance or data[field] != getattr(self.instance, field))]
         if self.instance:
@@ -147,16 +154,33 @@ class VishiSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {field: f'"{field}" cannot be changed after the vishi has started or has payment history.'}
                     )
-        schedule = ['frequency', 'draw_day', 'collection_day', 'release_day', 'start_date']
-        if not self.instance or changed:
-            values = {field: data.get(field, getattr(self.instance, field, None)) for field in schedule}
-            error = validate_day_constraints(values['draw_day'], values['collection_day'], values['release_day'], values['frequency'])
+        if self.instance and not changed:
+            return data
+        values = {field: data.get(field, getattr(self.instance, field, None)) for field in schedule}
+        explicit = any(field in data for field in date_fields) or any(values[field] for field in date_fields)
+        if explicit:
+            missing = [field for field in date_fields if values[field] is None]
+            if missing:
+                raise serializers.ValidationError({field: 'Select all three schedule dates.' for field in missing})
+            if any(field in data for field in day_fields):
+                raise serializers.ValidationError('Use schedule dates instead of mixing dates and day numbers.')
+            dates = [values[field] for field in date_fields]
+        else:
+            missing = [field for field in day_fields if values[field] is None]
+            if missing:
+                raise serializers.ValidationError({field: 'Select the draw, collection and release dates.' for field in date_fields})
+            error = validate_day_constraints(*(values[field] for field in day_fields), values['frequency'])
             if error:
                 raise serializers.ValidationError({'non_field_errors': [error]})
-            dates = compute_dates(**values)
-            for field in ['current_draw_date', 'current_collection_date', 'current_release_date']:
-                if dates[field] < values['start_date']:
-                    raise serializers.ValidationError({'start_date': 'Start date must not be after the first draw, collection or release date.'})
+            legacy = compute_dates(values['start_date'], *(values[field] for field in day_fields), values['frequency'])
+            dates = [legacy['current_draw_date'], legacy['current_collection_date'], legacy['current_release_date']]
+        error = validate_date_schedule(values['start_date'], *dates, values['frequency'])
+        if error:
+            raise serializers.ValidationError({'non_field_errors': [error]})
+        if not self.instance or any(field in changed for field in schedule):
+            for field, day_field, value in zip(date_fields, day_fields, dates):
+                data[field] = value
+                data[day_field] = value.day if values['frequency'] in MONTH_BASED else (value - values['start_date']).days + 1
         return data
 
 
