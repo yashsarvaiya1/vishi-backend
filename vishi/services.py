@@ -5,6 +5,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from dateutil.relativedelta import relativedelta
 from django.utils import timezone
+from django.db import transaction
 
 from .models import (
     Vishi, VishiParticipant, VishiDrawRecord,
@@ -27,13 +28,13 @@ def compute_dates(start_date, draw_day, collection_day, release_day, frequency):
     if frequency in MONTH_BASED:
         return {
             'current_draw_date':       start_date.replace(day=draw_day),
-            'current_collection_date': start_date.replace(day=collection_day),
+            'current_collection_date': start_date,
             'current_release_date':    start_date.replace(day=release_day),
         }
     else:
         return {
             'current_draw_date':       start_date + timedelta(days=draw_day - 1),
-            'current_collection_date': start_date + timedelta(days=collection_day - 1),
+            'current_collection_date': start_date,
             'current_release_date':    start_date + timedelta(days=release_day - 1),
         }
 
@@ -65,30 +66,61 @@ def validate_day_constraints(draw_day, collection_day, release_day, frequency):
     return None
 
 
-# ← ADDED: extracted so perform_draw and the admin force_charge action share the same logic
-def charge_vishi(vishi):
-    """
-    Charges all active ledgers for a vishi by one cycle amount.
-    Advances current_collection_date.
-    Called automatically after every draw (and by cron as a no-op safety net).
-    """
-    for ledger in CollectionLedger.objects.filter(vishi=vishi, is_active=True):
-        ledger.balance        -= vishi.amount
-        ledger.last_charged_at = timezone.now()
-        ledger.update_status()
-        ledger.save()
-        PaymentEntry.objects.create(
-            ledger       = ledger,
-            amount       = -vishi.amount,
-            entry_type   = 'charge',
-            cycle_number = vishi.current_cycle,
-            recorded_by  = None,
-        )
-    vishi.current_collection_date = advance_date(vishi.current_collection_date, vishi.frequency)
-    vishi.save(update_fields=['current_collection_date'])
+def collection_date(vishi, cycle_number):
+    # Always use the original anchor (31 Jan -> 28 Feb -> 31 Mar).
+    return vishi.start_date + FREQUENCY_DELTA[vishi.frequency] * (cycle_number - 1)
 
 
-def perform_draw(vishi):
+def current_collection_cycle(vishi, today=None):
+    today = today or timezone.localdate()
+    cycle = 0
+    while cycle < vishi.total_cycles and collection_date(vishi, cycle + 1) <= today:
+        cycle += 1
+    return cycle
+
+
+@transaction.atomic
+def charge_vishi(vishi, today=None):
+    """Apply due start-date periods once, including renewals missed during downtime."""
+    today = today or timezone.localdate()
+    locked = Vishi.all_objects.select_for_update().get(pk=vishi.pk)
+    if locked.is_deleted or today < locked.start_date or not locked.total_cycles:
+        return
+    due_cycle = current_collection_cycle(locked, today)
+    for cycle in range(locked.collection_cycle + 1, due_cycle + 1):
+        for ledger in locked.ledgers.select_for_update().filter(is_active=True):
+            # A late entrant owes their joining period, not periods before joining.
+            joined = timezone.localdate(ledger.participant.joined_at)
+            if joined >= collection_date(locked, cycle + 1):
+                continue
+            if ledger.entries.filter(entry_type='charge', cycle_number=cycle).exists():
+                continue
+            charge_participant(ledger, cycle, None)
+    locked.collection_cycle = max(locked.collection_cycle, due_cycle)
+    locked.current_collection_date = collection_date(locked, locked.collection_cycle + 1)
+    if locked.status == 'upcoming':
+        locked.status = 'active'
+    locked.save(update_fields=['collection_cycle', 'current_collection_date', 'status'])
+    vishi.collection_cycle = locked.collection_cycle
+    vishi.current_collection_date = locked.current_collection_date
+    vishi.status = locked.status
+
+
+def sync_collections(user=None, vishi_id=None):
+    today = timezone.localdate()
+    vishis = Vishi.objects.filter(current_collection_date__lte=today)
+    if vishi_id is not None:
+        vishis = vishis.filter(pk=vishi_id)
+    if user is not None and not user.is_superuser:
+        vishis = vishis.filter(participants__user=user, participants__is_active=True).distinct()
+    for vishi in vishis:
+        if vishi.collection_cycle < vishi.total_cycles:
+            charge_vishi(vishi, today)
+
+
+@transaction.atomic
+def perform_draw(vishi, hide_fixed=False):
+    charge_vishi(vishi)
     pool = VishiParticipant.objects.filter(vishi=vishi, is_active=True, is_drawn=False)
     if not pool.exists():
         return None, 'No remaining participants.'
@@ -109,6 +141,7 @@ def perform_draw(vishi):
         participant  = drawn,
         cycle_number = vishi.current_cycle + 1,
         was_fixed    = was_fixed,
+        hide_fixed   = was_fixed and hide_fixed,
         drawn_at     = date.today(),
     )
 
@@ -120,8 +153,6 @@ def perform_draw(vishi):
         vishi.status = 'completed'
 
     vishi.save()
-
-    charge_vishi(vishi)  # ← ADDED: charge all participants immediately after draw
 
     return record, None
 
@@ -145,7 +176,6 @@ def perform_release(vishi):
 
 def perform_skip(vishi, is_auto=False, reason=''):
     vishi.current_draw_date       = advance_date(vishi.current_draw_date,       vishi.frequency)
-    vishi.current_collection_date = advance_date(vishi.current_collection_date, vishi.frequency)
     vishi.current_release_date    = advance_date(vishi.current_release_date,    vishi.frequency)
     vishi.finish_date             = advance_date(vishi.finish_date,             vishi.frequency)
     vishi.missed_cycles          += 1
@@ -154,7 +184,10 @@ def perform_skip(vishi, is_auto=False, reason=''):
     SkipRecord.objects.create(vishi=vishi, is_auto=is_auto, reason=reason)
 
 
+@transaction.atomic
 def record_payment(ledger, amount, note, recorded_by):
+    charge_vishi(ledger.vishi)
+    ledger = CollectionLedger.objects.select_for_update().select_related('vishi').get(pk=ledger.pk)
     ledger.balance      += Decimal(str(amount))
     ledger.last_paid_at  = timezone.now()
     ledger.update_status()
@@ -164,7 +197,7 @@ def record_payment(ledger, amount, note, recorded_by):
         ledger       = ledger,
         amount       = Decimal(str(amount)),
         entry_type   = 'payment',
-        cycle_number = ledger.vishi.current_cycle,
+        cycle_number = current_collection_cycle(ledger.vishi),
         note         = note,
         recorded_by  = recorded_by,
     )
@@ -174,12 +207,14 @@ def record_payment(ledger, amount, note, recorded_by):
 # (after record_payment)
 
 
+@transaction.atomic
 def charge_participant(ledger, cycle_number, recorded_by):
     """
     Manually charge a single participant's ledger for a specific cycle.
     Used when a participant was added late or missed the auto-charge.
     Idempotent guard: raises ValueError if already charged for this cycle.
     """
+    ledger = CollectionLedger.objects.select_for_update().get(pk=ledger.pk)
     already = PaymentEntry.objects.filter(
         ledger=ledger, entry_type='charge', cycle_number=cycle_number
     ).exists()
@@ -197,18 +232,20 @@ def charge_participant(ledger, cycle_number, recorded_by):
         amount       = -vishi.amount,
         entry_type   = 'charge',
         cycle_number = cycle_number,
-        note         = f'Manual charge for cycle {cycle_number}',
+        note         = f'Manual charge for cycle {cycle_number}' if recorded_by else '',
         recorded_by  = recorded_by,
     )
     return ledger
 
 
+@transaction.atomic
 def waive_participant(ledger, cycle_number, note, recorded_by):
     """
     Waive a participant's charge for a specific cycle by crediting them
     the vishi amount. Creates a 'payment' entry marked as waiver.
     Idempotent guard: raises ValueError if already waived for this cycle.
     """
+    ledger = CollectionLedger.objects.select_for_update().get(pk=ledger.pk)
     already = PaymentEntry.objects.filter(
         ledger=ledger, entry_type='payment',
         cycle_number=cycle_number, note__startswith='Waived'

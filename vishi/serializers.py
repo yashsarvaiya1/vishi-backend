@@ -36,11 +36,19 @@ class VishiDrawRecordSerializer(serializers.ModelSerializer):
 class VishiDrawRecordPublicSerializer(serializers.ModelSerializer):
     vishi_name = serializers.CharField(source='participant.vishi_name')
     username   = serializers.CharField(source='participant.user.username')
+    was_fixed  = serializers.SerializerMethodField()
+
+    def get_was_fixed(self, obj):
+        return obj.was_fixed and not obj.hide_fixed
 
     class Meta:
         model  = VishiDrawRecord
         fields = ['cycle_number', 'vishi_name', 'username', 'was_fixed',
                   'drawn_at', 'is_released', 'released_at', 'released_amount']
+
+
+class DrawOptionsSerializer(serializers.Serializer):
+    hide_fixed = serializers.BooleanField(default=False)
 
 
 class VishiParticipantAdminSerializer(serializers.ModelSerializer):
@@ -103,7 +111,7 @@ class VishiSerializer(serializers.ModelSerializer):
         model            = Vishi
         fields           = '__all__'
         read_only_fields = ['current_draw_date', 'current_collection_date', 'current_release_date',
-                            'finish_date', 'total_cycles', 'current_cycle', 'missed_cycles',
+                            'finish_date', 'total_cycles', 'current_cycle', 'collection_cycle', 'missed_cycles',
                             'status', 'fix_draw_participant', 'created_by', 'created_at',
                             'updated_at', 'is_deleted', 'deleted_at']
 
@@ -130,7 +138,7 @@ class VishiPublicSerializer(serializers.ModelSerializer):
         model  = Vishi
         fields = ['id', 'name', 'amount', 'frequency', 'current_draw_date',
                   'current_collection_date', 'current_release_date', 'start_date',
-                  'finish_date', 'status', 'current_cycle', 'total_cycles',
+                  'finish_date', 'status', 'current_cycle', 'collection_cycle', 'total_cycles',
                   'participants', 'draw_records']
 
 

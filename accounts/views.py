@@ -168,6 +168,12 @@ class AuthViewSet(viewsets.ViewSet):
 class ProfileViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if self.action in ['my_vishis', 'my_payments']:
+            from vishi.services import sync_collections
+            sync_collections(request.user)
+
     @action(detail=False, methods=['get'], url_path='me')
     def me(self, request):
         return Response(UserSerializer(request.user).data)

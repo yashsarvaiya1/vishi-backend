@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 from decimal import Decimal
+from django.db import transaction
 
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, status, filters
@@ -21,16 +22,24 @@ from .serializers import (
     DashboardSerializer, PaymentsSummarySerializer,
     UserParticipationSlotSerializer,
     MyVishiGroupedSerializer, MyPaymentVishiSerializer,
+    DrawOptionsSerializer,
 )
 from .permissions import IsSuperUser, IsAuthenticatedReadOrSuperUserWrite
 from .services import (
     compute_dates, compute_finish_date, validate_day_constraints,
     perform_draw, perform_release, perform_skip, record_payment,
     charge_participant, waive_participant,
+    charge_vishi, sync_collections, current_collection_cycle,
 )
 
 
-class VishiViewSet(viewsets.ModelViewSet):
+class CollectionSyncMixin:
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        sync_collections(request.user, kwargs.get('vishi_pk') or kwargs.get('pk'))
+
+
+class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticatedReadOrSuperUserWrite]
     filter_backends    = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields   = ['status', 'frequency', 'is_deleted']
@@ -85,6 +94,12 @@ class VishiViewSet(viewsets.ModelViewSet):
             status                  = vishi_status,
         )
 
+    def perform_update(self, serializer):
+        vishi = serializer.save()
+        if not vishi.collection_cycle:
+            vishi.current_collection_date = vishi.start_date
+            vishi.save(update_fields=['current_collection_date'])
+
     def destroy(self, request, *args, **kwargs):
         vishi = self.get_object()
         if vishi.status == 'upcoming' and vishi.total_cycles == 0:
@@ -114,6 +129,8 @@ class VishiViewSet(viewsets.ModelViewSet):
                 f'Draw date is {vishi.current_draw_date}. Cannot draw before that date.'
             )
 
+        options = DrawOptionsSerializer(data=request.data)
+        options.is_valid(raise_exception=True)
         fix_participant_id = request.data.get('fix_participant_id')
         if fix_participant_id:
             try:
@@ -128,7 +145,7 @@ class VishiViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        record, error = perform_draw(vishi)
+        record, error = perform_draw(vishi, hide_fixed=options.validated_data['hide_fixed'])
         if error:
             return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
         return Response(VishiDrawRecordSerializer(record).data)
@@ -199,7 +216,7 @@ class VishiViewSet(viewsets.ModelViewSet):
         return Response({'detail': 'Vishi restored.'})
 
 
-class VishiParticipantViewSet(viewsets.ModelViewSet):
+class VishiParticipantViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticatedReadOrSuperUserWrite]
     filter_backends    = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields   = ['is_active', 'is_drawn']
@@ -223,19 +240,26 @@ class VishiParticipantViewSet(viewsets.ModelViewSet):
             return VishiParticipantAdminSerializer
         return VishiParticipantPublicSerializer
 
+    @transaction.atomic
     def perform_create(self, serializer):
         if not self.request.user.is_superuser:
             raise PermissionDenied('Only admin can add participants.')
         vishi_pk = self.kwargs['vishi_pk']
-        vishi    = Vishi.all_objects.get(pk=vishi_pk)
+        vishi    = Vishi.all_objects.select_for_update().get(pk=vishi_pk)
+        if vishi.is_deleted:
+            raise ValidationError('Cannot add participants to a deleted vishi.')
         if vishi.status == 'completed':
             raise ValidationError({'non_field_errors': ['Cannot add participants to a completed vishi.']})
         participant = serializer.save(vishi=vishi)
-        CollectionLedger.objects.create(vishi=vishi, participant=participant)
+        ledger = CollectionLedger.objects.create(vishi=vishi, participant=participant)
         count              = vishi.participants.filter(is_active=True).count()
         vishi.total_cycles = count
         vishi.finish_date  = compute_finish_date(vishi.start_date, count, vishi.frequency)
         vishi.save(update_fields=['total_cycles', 'finish_date'])
+        charge_vishi(vishi)
+        cycle = current_collection_cycle(vishi)
+        if cycle and not ledger.entries.filter(entry_type='charge', cycle_number=cycle).exists():
+            charge_participant(ledger, cycle, None)
 
     def perform_update(self, serializer):
         if not self.request.user.is_superuser:
@@ -320,7 +344,7 @@ class VishiParticipantViewSet(viewsets.ModelViewSet):
         return Response({'detail': 'Participant removed.'}, status=status.HTTP_200_OK)
 
 
-class CollectionLedgerViewSet(viewsets.ReadOnlyModelViewSet):
+class CollectionLedgerViewSet(CollectionSyncMixin, viewsets.ReadOnlyModelViewSet):
     serializer_class   = CollectionLedgerSerializer
     permission_classes = [IsAuthenticatedReadOrSuperUserWrite]
     filter_backends    = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -384,7 +408,7 @@ class SkipRecordViewSet(viewsets.ReadOnlyModelViewSet):
         return SkipRecord.objects.filter(vishi_id=self.kwargs['vishi_pk'])
 
 
-class DashboardView(APIView):
+class DashboardView(CollectionSyncMixin, APIView):
     permission_classes = [IsSuperUser]
 
     def get(self, request):
@@ -459,11 +483,11 @@ class DashboardView(APIView):
         return Response(DashboardSerializer(data).data)
 
 
-class PaymentsSummaryView(APIView):
+class PaymentsSummaryView(CollectionSyncMixin, APIView):
     permission_classes = [IsSuperUser]
 
     def get(self, request):
-        active_vishis     = Vishi.objects.filter(status='active', is_deleted=False)
+        active_vishis     = Vishi.objects.filter(status__in=['active', 'completed'], is_deleted=False)
         total_outstanding = Decimal('0')
         total_due_count   = 0
         by_vishi          = []
@@ -498,7 +522,7 @@ class PaymentsSummaryView(APIView):
         return Response(PaymentsSummarySerializer(data).data)
 
 
-class MyVishisView(APIView):
+class MyVishisView(CollectionSyncMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -553,7 +577,7 @@ class MyVishisView(APIView):
         return Response(MyVishiGroupedSerializer(result, many=True).data)
 
 
-class MyPaymentsView(APIView):
+class MyPaymentsView(CollectionSyncMixin, APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):

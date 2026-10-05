@@ -2,11 +2,8 @@
 
 from django.contrib import admin
 from django.contrib import messages                                          # ← add
-from django.utils import timezone                                            # ← add
-from decimal import Decimal                                                  # ← add
 from .models import Vishi, VishiParticipant, VishiDrawRecord, CollectionLedger, PaymentEntry
 from .services import perform_draw, perform_release, perform_skip           # ← add
-from .models import PaymentEntry as PE                                       # alias to avoid shadowing
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
@@ -47,39 +44,14 @@ def force_skip(modeladmin, request, queryset):
         modeladmin.message_user(request, f'"{vishi.name}" — cycle skipped, dates advanced.', level=messages.SUCCESS)
 
 
-@admin.action(description='🧾 Force Charge Collection (bypass date check)')  # ← add
+@admin.action(description='🧾 Sync Due Collections')
 def force_charge(modeladmin, request, queryset):
-    """
-    Runs the same logic as the charge_collection cron but immediately,
-    regardless of what current_collection_date is.
-    Also advances current_collection_date exactly like the cron does.
-    """
-    from .services import advance_date
+    from .services import charge_vishi
     for vishi in queryset:
-        if vishi.status != 'active':
-            modeladmin.message_user(request, f'"{vishi.name}" is not active — skipped.', level=messages.WARNING)
-            continue
-        ledgers = CollectionLedger.objects.filter(vishi=vishi, is_active=True)
-        if not ledgers.exists():
-            modeladmin.message_user(request, f'"{vishi.name}" has no active ledgers — skipped.', level=messages.WARNING)
-            continue
-        for ledger in ledgers:
-            ledger.balance        -= vishi.amount
-            ledger.last_charged_at = timezone.now()
-            ledger.update_status()
-            ledger.save()
-            PE.objects.create(
-                ledger       = ledger,
-                amount       = -vishi.amount,
-                entry_type   = 'charge',
-                cycle_number = vishi.current_cycle,
-                recorded_by  = None,
-            )
-        vishi.current_collection_date = advance_date(vishi.current_collection_date, vishi.frequency)
-        vishi.save(update_fields=['current_collection_date'])
+        charge_vishi(vishi)
         modeladmin.message_user(
             request,
-            f'"{vishi.name}" — charged ₹{vishi.amount} to {ledgers.count()} participant(s). Next collection: {vishi.current_collection_date}',
+            f'"{vishi.name}" — due collections synced. Next renewal: {vishi.current_collection_date}',
             level=messages.SUCCESS,
         )
 

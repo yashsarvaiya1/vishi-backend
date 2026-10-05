@@ -36,6 +36,7 @@ class Vishi(models.Model):
     finish_date             = models.DateField()
     status                  = models.CharField(max_length=20, choices=STATUS_CHOICES, default='upcoming')
     current_cycle           = models.PositiveIntegerField(default=0)
+    collection_cycle        = models.PositiveIntegerField(default=0)
     total_cycles            = models.PositiveIntegerField(default=0)
     missed_cycles           = models.PositiveIntegerField(default=0)
     fix_draw_participant    = models.ForeignKey(
@@ -88,6 +89,7 @@ class VishiDrawRecord(models.Model):
     participant     = models.ForeignKey(VishiParticipant, on_delete=models.PROTECT, related_name='draw_records')
     cycle_number    = models.PositiveIntegerField()
     was_fixed       = models.BooleanField(default=False)
+    hide_fixed      = models.BooleanField(default=False)
     drawn_at        = models.DateField()
     is_released     = models.BooleanField(default=False)
     released_at     = models.DateField(null=True, blank=True)
