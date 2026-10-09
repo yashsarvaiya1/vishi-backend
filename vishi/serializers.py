@@ -60,6 +60,7 @@ class VishiDrawRecordPublicSerializer(serializers.ModelSerializer):
 
 class DrawOptionsSerializer(serializers.Serializer):
     hide_fixed = serializers.BooleanField(default=False)
+    force = serializers.BooleanField(default=False)
 
 
 class VishiParticipantAdminSerializer(serializers.ModelSerializer):

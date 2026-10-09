@@ -129,13 +129,17 @@ def current_collection_cycle(vishi, today=None):
 
 
 @transaction.atomic
-def charge_vishi(vishi, today=None):
+def charge_vishi(vishi, today=None, through_cycle=None):
     """Apply due start-date periods once, including renewals missed during downtime."""
     today = today or timezone.localdate()
     locked = Vishi.all_objects.select_for_update().get(pk=vishi.pk)
-    if locked.is_deleted or today < locked.start_date or not locked.total_cycles:
+    if locked.is_deleted or (today < locked.start_date and through_cycle is None) or not locked.total_cycles:
         return
-    due_cycle = current_collection_cycle(locked, today)
+    due_cycle = max(locked.collection_cycle, current_collection_cycle(locked, today))
+    if through_cycle is not None:
+        if not 1 <= through_cycle <= locked.total_cycles:
+            raise ValueError('Invalid collection cycle.')
+        due_cycle = max(due_cycle, through_cycle)
     for cycle in range(locked.collection_cycle + 1, due_cycle + 1):
         for ledger in locked.ledgers.select_for_update().filter(is_active=True):
             # A late entrant owes their joining period, not periods before joining.
@@ -170,11 +174,22 @@ def sync_collections(user=None, vishi_id=None):
 
 
 @transaction.atomic
-def perform_draw(vishi, hide_fixed=False):
-    charge_vishi(vishi)
+def perform_draw(vishi, hide_fixed=False, force=False):
+    Vishi.all_objects.select_for_update().get(pk=vishi.pk)
+    vishi.refresh_from_db()
+    if vishi.is_deleted or vishi.status not in ('active', 'upcoming'):
+        return None, 'Vishi is not active.'
+    if not force and (timezone.localdate() < vishi.start_date or timezone.localdate() < vishi.current_draw_date):
+        return None, 'Cannot draw before the scheduled draw date.'
+    if vishi.current_cycle >= vishi.total_cycles:
+        return None, 'No remaining cycles.'
+    if vishi.draw_records.filter(is_released=False).exists():
+        return None, 'Release the previous draw before drawing the next cycle.'
     pool = VishiParticipant.objects.filter(vishi=vishi, is_active=True, is_drawn=False)
     if not pool.exists():
         return None, 'No remaining participants.'
+
+    charge_vishi(vishi, through_cycle=vishi.current_cycle + 1 if force else None)
 
     fix = vishi.fix_draw_participant
     if fix and pool.filter(pk=fix.pk).exists():
@@ -193,7 +208,7 @@ def perform_draw(vishi, hide_fixed=False):
         cycle_number = vishi.current_cycle + 1,
         was_fixed    = was_fixed,
         hide_fixed   = was_fixed and hide_fixed,
-        drawn_at     = date.today(),
+        drawn_at     = timezone.localdate(),
     )
 
     vishi.current_cycle       += 1
@@ -208,15 +223,20 @@ def perform_draw(vishi, hide_fixed=False):
     return record, None
 
 
+@transaction.atomic
 def perform_release(vishi):
+    Vishi.all_objects.select_for_update().get(pk=vishi.pk)
+    vishi.refresh_from_db()
     try:
         record = VishiDrawRecord.objects.get(vishi=vishi, cycle_number=vishi.current_cycle)
     except VishiDrawRecord.DoesNotExist:
         return None, 'No draw record for current cycle.'
+    if record.is_released:
+        return None, 'This draw has already been released.'
 
     active_count           = vishi.participants.filter(is_active=True).count()
     record.is_released     = True
-    record.released_at     = date.today()
+    record.released_at     = timezone.localdate()
     record.released_amount = vishi.amount * active_count
     record.save()
 
@@ -249,7 +269,7 @@ def record_payment(ledger, amount, note, recorded_by):
         ledger       = ledger,
         amount       = Decimal(str(amount)),
         entry_type   = 'payment',
-        cycle_number = current_collection_cycle(ledger.vishi),
+        cycle_number = max(ledger.vishi.collection_cycle, current_collection_cycle(ledger.vishi)),
         note         = note,
         recorded_by  = recorded_by,
         settlement   = settlement,

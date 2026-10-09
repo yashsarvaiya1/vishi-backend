@@ -817,3 +817,180 @@ class ExplicitScheduleMigrationTests(TransactionTestCase):
             self.assertEqual(PaymentEntry.objects.get(pk=entry.pk).settlement, settlement)
         finally:
             MigrationExecutor(connection).migrate(latest)
+
+
+class ForceDrawTests(CollectionTestCase):
+    def setup_future(self, total=3):
+        vishi = self.make_vishi(start=date(2026, 10, 10), total=total, status='upcoming')
+        ledgers = [self.make_ledger(vishi, joined=self.today) for _ in range(total)]
+        return vishi, ledgers
+
+    def draw(self, vishi, **options):
+        return self.client.post(f'/api/vishis/{vishi.pk}/draw/', options, format='json')
+
+    def release(self, vishi):
+        return self.client.post(f'/api/vishis/{vishi.pk}/release/', {}, format='json')
+
+    def test_force_before_start_charges_every_participant_and_allows_unpaid_release(self):
+        vishi, ledgers = self.setup_future()
+        result = self.draw(vishi, force=True)
+        self.assertEqual(result.status_code, 200, result.data)
+        vishi.refresh_from_db()
+        self.assertEqual((vishi.status, vishi.current_cycle, vishi.collection_cycle), ('active', 1, 1))
+        self.assertEqual(vishi.next_renewal_date, date(2026, 11, 10))
+        for ledger in ledgers:
+            ledger.refresh_from_db()
+            self.assertEqual((ledger.balance, ledger.status), (Decimal('-1000'), 'due'))
+            self.assertEqual(ledger.entries.get(entry_type='charge').cycle_number, 1)
+        result = self.release(vishi)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(Decimal(result.data['released_amount']), 3000)
+        for ledger in ledgers:
+            ledger.refresh_from_db()
+            self.assertEqual(ledger.balance, -1000)
+
+    def test_force_keeps_existing_advance_credit_and_payment_settlement(self):
+        vishi, ledgers = self.setup_future()
+        record_payment(ledgers[0], 1500, '', self.admin)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        ledgers[0].refresh_from_db()
+        self.assertEqual((ledgers[0].balance, ledgers[0].status), (500, 'overpaid'))
+        record_payment(ledgers[1], 1000, '', self.admin)
+        entry = ledgers[1].entries.get(entry_type='payment')
+        self.assertEqual(entry.cycle_number, 1)
+        self.assertEqual(entry.settlement, {'late_amount': '0.00', 'due_amount': '1000.00', 'advance_amount': '0.00'})
+
+    def test_force_current_period_does_not_recharge_paid_participant(self):
+        vishi = self.make_vishi()
+        ledger = self.make_ledger(vishi)
+        record_payment(ledger, 1000, '', self.admin)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        ledger.refresh_from_db()
+        self.assertEqual(ledger.balance, 0)
+        self.assertEqual(ledger.entries.filter(entry_type='charge').count(), 1)
+
+    def test_future_cycles_and_cron_are_charged_once(self):
+        vishi, ledgers = self.setup_future()
+        for cycle in (1, 2):
+            result = self.draw(vishi, force=True)
+            self.assertEqual(result.status_code, 200, result.data)
+            self.assertEqual(result.data['cycle_number'], cycle)
+            self.assertEqual(self.release(vishi).status_code, 200)
+        for day in (date(2026, 10, 10), date(2026, 11, 10)):
+            self.today = day
+            charge_collection()
+            charge_collection()
+        vishi.refresh_from_db()
+        self.assertEqual(vishi.collection_cycle, 2)
+        self.assertEqual(vishi.next_renewal_date, date(2026, 12, 10))
+        for ledger in ledgers:
+            ledger.refresh_from_db()
+            self.assertEqual(ledger.balance, -2000)
+            self.assertEqual(list(ledger.entries.filter(entry_type='charge').order_by('cycle_number').values_list('cycle_number', flat=True)), [1, 2])
+        self.today = date(2026, 12, 10)
+        charge_collection()
+        for ledger in ledgers:
+            ledger.refresh_from_db()
+            self.assertEqual(ledger.balance, -3000)
+            self.assertEqual(ledger.entries.filter(entry_type='charge').count(), 3)
+
+    def test_pending_release_blocks_another_draw_without_another_charge(self):
+        vishi, ledgers = self.setup_future()
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        result = self.draw(vishi, force=True)
+        self.assertEqual(result.status_code, 400)
+        self.assertIn('Release the previous draw', str(result.data))
+        self.assertEqual(vishi.draw_records.count(), 1)
+        self.assertEqual(ledgers[0].entries.filter(entry_type='charge').count(), 1)
+
+    def test_repeat_release_does_not_advance_schedule_twice(self):
+        vishi, _ = self.setup_future()
+        self.assertEqual(self.release(vishi).status_code, 400)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        self.assertEqual(self.release(vishi).status_code, 200)
+        vishi.refresh_from_db()
+        release_date = vishi.current_release_date
+        self.assertEqual(self.release(vishi).status_code, 400)
+        vishi.refresh_from_db()
+        self.assertEqual(vishi.current_release_date, release_date)
+
+    def test_final_forced_draw_can_release_unpaid_then_rejects_more_draws(self):
+        vishi, ledgers = self.setup_future(total=1)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        vishi.refresh_from_db()
+        self.assertEqual(vishi.status, 'completed')
+        self.assertEqual(self.release(vishi).status_code, 200)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 400)
+        self.assertEqual(ledgers[0].entries.filter(entry_type='charge').count(), 1)
+
+    def test_normal_draw_still_rejects_early_dates_and_invalid_force(self):
+        vishi, ledgers = self.setup_future()
+        for options in ({}, {'force': False}, {'force': 'invalid'}):
+            self.assertEqual(self.draw(vishi, **options).status_code, 400)
+        self.assertFalse(vishi.draw_records.exists())
+        self.assertFalse(ledgers[0].entries.exists())
+        vishi.status = 'active'
+        vishi.save()
+        self.assertEqual(self.draw(vishi).status_code, 400)
+
+    def test_member_and_deleted_vishi_cannot_force_draw(self):
+        vishi, _ = self.setup_future()
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.draw(vishi, force=True).status_code, 403)
+        self.client.force_authenticate(self.admin)
+        vishi.soft_delete()
+        self.assertEqual(self.draw(vishi, force=True).status_code, 404)
+        self.assertFalse(vishi.draw_records.exists())
+
+    def test_force_draw_retains_fixed_winner_and_visibility_options(self):
+        vishi, ledgers = self.setup_future()
+        result = self.draw(vishi, force=True, fix_participant_id=ledgers[1].participant_id, hide_fixed=True)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['participant'], ledgers[1].participant_id)
+        self.assertTrue(result.data['was_fixed'])
+        self.assertTrue(result.data['hide_fixed'])
+
+    def test_participant_added_before_start_after_force_owes_forced_cycle(self):
+        vishi, _ = self.setup_future()
+        self.assertEqual(self.draw(vishi, force=True).status_code, 200)
+        result = self.client.post(f'/api/vishis/{vishi.pk}/participants/', {'user': self.user.pk, 'vishi_name': 'New slot'}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        ledger = CollectionLedger.objects.get(participant_id=result.data['id'])
+        self.assertEqual(ledger.balance, -1000)
+        self.assertEqual(ledger.entries.get(entry_type='charge').cycle_number, 1)
+
+
+class ForceDrawConcurrencyTests(TransactionTestCase):
+    setUp = CollectionTestCase.setUp
+    localdate = CollectionTestCase.localdate
+    make_vishi = CollectionTestCase.make_vishi
+    make_ledger = CollectionTestCase.make_ledger
+
+    def test_simultaneous_force_draws_make_only_one_unreleased_draw(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from django.db import close_old_connections
+        if connection.vendor != 'postgresql':
+            self.skipTest('Requires PostgreSQL row locks.')
+        vishi = self.make_vishi(start=date(2026, 10, 10), total=2, status='upcoming')
+        ledgers = [self.make_ledger(vishi, joined=self.today) for _ in range(2)]
+        barrier = Barrier(2)
+
+        def draw():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(self.admin)
+                barrier.wait(timeout=10)
+                return client.post(f'/api/vishis/{vishi.pk}/draw/', {'force': True}, format='json').status_code
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: draw(), range(2)))
+        self.assertEqual(sorted(results), [200, 400])
+        self.assertEqual(vishi.draw_records.count(), 1)
+        for ledger in ledgers:
+            ledger.refresh_from_db()
+            self.assertEqual(ledger.balance, -1000)
+            self.assertEqual(ledger.entries.filter(entry_type='charge').count(), 1)

@@ -140,17 +140,22 @@ class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
         return Response({'detail': 'Vishi activated.'})
 
     @action(detail=True, methods=['post'], url_path='draw')
+    @transaction.atomic
     def draw(self, request, pk=None):
         vishi = self.get_object()
-        if vishi.status != 'active':
+        vishi = Vishi.all_objects.select_for_update().get(pk=vishi.pk)
+        options = DrawOptionsSerializer(data=request.data)
+        options.is_valid(raise_exception=True)
+        force = options.validated_data['force']
+        if vishi.status != 'active' and not (force and vishi.status == 'upcoming'):
             raise ValidationError('Vishi is not active.')
-        if date.today() < vishi.current_draw_date:
+        if not force and timezone.localdate() < vishi.current_draw_date:
             raise ValidationError(
                 f'Draw date is {vishi.current_draw_date}. Cannot draw before that date.'
             )
 
-        options = DrawOptionsSerializer(data=request.data)
-        options.is_valid(raise_exception=True)
+        if vishi.draw_records.filter(is_released=False).exists():
+            raise ValidationError('Release the previous draw before drawing the next cycle.')
         fix_participant_id = request.data.get('fix_participant_id')
         if fix_participant_id:
             try:
@@ -165,7 +170,7 @@ class VishiViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        record, error = perform_draw(vishi, hide_fixed=options.validated_data['hide_fixed'])
+        record, error = perform_draw(vishi, hide_fixed=options.validated_data['hide_fixed'], force=force)
         if error:
             return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
         return Response(VishiDrawRecordSerializer(record).data)
@@ -277,7 +282,7 @@ class VishiParticipantViewSet(CollectionSyncMixin, viewsets.ModelViewSet):
         vishi.finish_date  = compute_finish_date(vishi.start_date, count, vishi.frequency)
         vishi.save(update_fields=['total_cycles', 'finish_date'])
         charge_vishi(vishi)
-        cycle = current_collection_cycle(vishi)
+        cycle = max(vishi.collection_cycle, current_collection_cycle(vishi))
         if cycle and not ledger.entries.filter(entry_type='charge', cycle_number=cycle).exists():
             charge_participant(ledger, cycle, None)
 
